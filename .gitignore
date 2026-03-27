@@ -1,0 +1,13 @@
+gen_data*/
+
+*.zip
+
+models/
+
+__pycache__/
+.ipynb_checkpoints/
+*.ipynb_checkpoints*
+
+* (Copy).*
+
+results/
