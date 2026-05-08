@@ -11,6 +11,16 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
+from sklearn.model_selection import train_test_split
+
+import warnings
+warnings.filterwarnings('ignore')
+
+
+import torch
+
+from lifelines import KaplanMeierFitter
+
 
 N_DV = 20
 
@@ -270,8 +280,9 @@ class CSVDataLoader:
         assert(windows.shape[0] == y.shape[0])
         return windows, y
     
-    def get_full_data(self, max_samples: Optional[int] = None,  window=None) -> Tuple[pd.DataFrame, pd.Series]:
-        X_list, y_list = [], []
+    def get_full_data(self, max_samples: Optional[int] = None,  window=None, get_simulation_ids=False) -> Tuple[pd.DataFrame, pd.Series]:
+        X_list, y_list, sim_id_list = [], [], []
+        sim_id_cnt = 0
 
         if max_samples is None and self.max_samples is not None:
             max_samples = self.max_samples
@@ -283,6 +294,8 @@ class CSVDataLoader:
                 tmp_x, tmp_y = self._generate_windows(tmp_x, tmp_y, window)
             X_list.append(tmp_x)
             y_list.append(tmp_y)
+            sim_id_list.append(pd.Series([sim_id_cnt] * len(tmp_x)))
+            sim_id_cnt += 1
         
         # Нормальные данные
         for file in self.normal_files:
@@ -291,6 +304,8 @@ class CSVDataLoader:
                 tmp_x, tmp_y = self._generate_windows(tmp_x, tmp_y, window)
             X_list.append(tmp_x)
             y_list.append(tmp_y)
+            sim_id_list.append(pd.Series([sim_id_cnt] * len(tmp_x)))
+            sim_id_cnt += 1
 
         
         # Объединение
@@ -304,6 +319,8 @@ class CSVDataLoader:
         else:
             y = np.concatenate(y_list).astype(bool)
 
+        simulation_ids = pd.concat(sim_id_list, ignore_index=True)
+
         if self.normalize and not self.scaler_fitted:
             X = self._normalize_data(X)
             
@@ -312,15 +329,19 @@ class CSVDataLoader:
 
             X = X.iloc[indices] if hasattr(X, 'iloc') else X[indices]
             y = y.iloc[indices] if hasattr(y, 'iloc') else y[indices]
+            simulation_ids = simulation_ids.iloc[indices]
         
         # Ограничение по количеству samples
         if max_samples is not None and max_samples < len(X):
             X = X.iloc[:max_samples] if hasattr(X, 'iloc') else X[:max_samples]
             y = y.iloc[:max_samples] if hasattr(y, 'iloc') else y[:max_samples]
+            simulation_ids = simulation_ids.iloc[:max_samples]
         
         # print(f"Loaded {len(X)} samples from {len(self.files)} main files and {len(self.normal_files)} normal files")
         print(f"   Итого: X.shape={X.shape}, y.shape={y.shape}")
         print(f"   Доля аномалий: {y.mean():.4f}")
+        if get_simulation_ids:
+            return X, y, simulation_ids
         return X, y
 
 
@@ -331,8 +352,8 @@ class DetectionEvaluator:
     def add_detection_delay(self, ground_truth):
         delayed_gt = ground_truth.copy()
         for i in range(len(ground_truth)):
-            if ground_truth[i] and i + self.delay_window < len(ground_truth):
-                delayed_gt[i:i+self.delay_window] = True
+            if ground_truth[i]:
+                delayed_gt[i:min(len(ground_truth), i+self.delay_window)] = True
         return delayed_gt
     
     def calculate_binary_metrics(self, predictions, ground_truth, apply_delay=True):
@@ -359,9 +380,6 @@ class DetectionEvaluator:
         }
 
 
-import warnings
-warnings.filterwarnings('ignore')
-
 class BaseAnomalyDetector:
     def __init__(self, model_class, **params):
         self.model_class = model_class
@@ -380,15 +398,26 @@ class BaseAnomalyDetector:
         if self.model is None:
             raise ValueError()
         if isinstance(self.model, LocalOutlierFactor):
-            scores = -self.model.negative_outlier_factor_
+            if self.model.novelty:  # ← проверяем режим
+                scores = -self.model.decision_function(X)
+            else:
+                scores = -self.model.negative_outlier_factor_
         elif hasattr(self.model, "decision_function"):
             scores = -self.model.decision_function(X)
         elif hasattr(self.model, "score_samples"): 
             scores = -self.model.score_samples(X)
         else:
             raise NotImplementedError()
+
+        if hasattr(self.model, '_raw_scores_fitted'):
+            min_score = self.model._min_score
+            max_score = self.model._max_score
+            normalized = (scores - min_score) / (max_score - min_score)
+            normalized = np.clip(normalized, 0, 1)
+        else:
+            normalized = 1 / (1 + np.exp(-scores / np.std(scores)))
         
-        return scores
+        return normalized
     
     def get_params(self):
         return self.params
@@ -410,9 +439,12 @@ class ExperimentRunner:
         self.detectors[name] = {'class': model_class, 'default_params': default_params}
     
     
-    def run_single_experiment(self, detector_name, X, y,
+    def run_single_experiment(self, detector_name, X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
                             detector_params=None, delays=None, thresholds=None):
-                            
+        if hasattr(y_train, 'values'):
+            y_train = y_train.values
+        if hasattr(y_test, 'values'):
+            y_test = y_test.values
         # if delays is None:
         #     delays = [0, 1, 2, 5, 10]
         if detector_params is None:
@@ -424,13 +456,20 @@ class ExperimentRunner:
         )
         
         try:
-            detector.fit(X)
-            scores = detector.predict_scores(X)
             
+            detector.model = detector.model_class(**detector_params)
+            if detector_name == 'GradientBoosting':
+                detector.model.fit(X_train, y_train)
+            else:
+                detector.model.fit(X_train)
+            scores = detector.predict_scores(X_test)
+            # print(f"{detector_name=}: range=[{scores.min():.3f}, {scores.max():.3f}], "
+            #       f"mean={scores.mean():.3f}, std={scores.std():.3f}, "
+            #       f"p50={np.median(scores):.3f}, p75={np.percentile(scores, 75):.3f}, p90={np.percentile(scores, 90):.3f}")            
             experiment_results = []
-            # for delay in delays:
             evaluator = self.evaluator()
-            metrics = evaluator.calculate_metrics(scores, y, apply_delay=False)
+            
+            metrics = evaluator.calculate_metrics(scores, y_test, apply_delay=False, simulation_ids=sim_ids_test)
             experiment_results.append({
                 'detector': detector_name,
                 # 'delay': delay,
@@ -442,52 +481,61 @@ class ExperimentRunner:
             
         except Exception as e:
             print(f"Ошибка в эксперименте {detector_name}: {e}")
-            return ValueError()
+            return []
     
-    def run_comprehensive_experiments(self, data_params_list, model_params_list, 
-                                    train_size=0.7, test_delays=None, custom_thresholds=None):
+    def run_comprehensive_experiments(self, model_params_list, window=30,
+                                    train_size=0.7, test_delays=None, custom_thresholds=None, autoencoder=None, random_state=42):
         if test_delays is None:
             test_delays = [0, 1, 2, 5, 10, 15, 20]
         
         all_results = []
 
-        if data_params_list is None:
-            data_params_list = [None]
-        for data_params in data_params_list:
-            if data_params is None:
-                dataset, target = self.data_generator.get_full_data()
-            else:
-                norm_data, anomaly_data, dvs = self.data_generator.generate_data(
-                    **data_params
-                )
+        dataset, target, simulation_ids = self.data_generator.get_full_data(get_simulation_ids=True, window=window)
 
-                dataset, target = get_dataset_from_generated_data(norm_data, anomaly_data, dvs)
+        if autoencoder is not None:
+            print(f"Применяем автоэнкодер к данным. Исходная форма: {dataset.shape}")
+            dataset_tensor = torch.FloatTensor(dataset.values if hasattr(dataset, 'values') else dataset)
+            dataset = autoencoder.encode(dataset_tensor).detach().cpu().numpy()
+            print(f"После автоэнкодера: {dataset.shape}")
+
+        X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
+            dataset, target, simulation_ids,
+            train_size=train_size, 
+            random_state=random_state,
+            shuffle=False, # по-хорошему не надо перемешивать
+            # stratify=target
+        )
+        y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
+        sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else si
+        print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")
             
+        
+        for detector_name in self.detectors.keys():                
+            if detector_name in model_params_list:
+                param_combinations = model_params_list[detector_name]
+            else:
+                param_combinations = [{}]
             
-            for detector_name in self.detectors.keys():                
-                if detector_name in model_params_list:
-                    param_combinations = model_params_list[detector_name]
-                else:
-                    param_combinations = [{}]
+            for params in param_combinations:
+                results = self.run_single_experiment(
+                    detector_name, 
+                    X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
+                    # dataset, target,
+                    detector_params=params, delays=test_delays,
+                    thresholds=custom_thresholds,
+                    # autoencoder=autoencoder
+                )
+                # print(results)
                 
-                for params in param_combinations:
-                    results = self.run_single_experiment(
-                        detector_name, dataset, target,
-                        detector_params=params, delays=test_delays,
-                        thresholds=custom_thresholds
-                    )
-                    # print(results)
+                for result in results:
+                    result.update({
+                        'freq': "3min",
+                        'size': len(dataset),
+                        'anomaly_ratio': np.mean(target),
+                        'model_params': params
+                    })
                     
-                    for result in results:
-                        result.update({
-                            'data_params': ("" if data_params is None else str(data_params)),
-                            'freq': ("3min" if data_params is None else data_params.get("freq", "60s")),
-                            'size': len(dataset),
-                            'anomaly_ratio': np.mean(target),
-                            'model_params': params
-                        })
-                    
-                    all_results.extend(results)
+                all_results.extend(results)
         
         self.results = pd.DataFrame(all_results)
         return self.results
@@ -496,6 +544,20 @@ class ExperimentRunner:
     
     def get_best_models(self, metric='roc_auc', top_k=5):
         return (self.results.nlargest(top_k, metric))
+
+    def get_best_per_detector(self, metric='pr_auc'):
+        """
+        Возвращает таблицу с лучшими параметрами для каждого детектора по указанной метрике
+        """
+        if self.results is None or self.results.empty:
+            return pd.DataFrame()
+        
+        best_per_detector = self.results.loc[
+            self.results.groupby('detector')[metric].idxmax()
+        ].reset_index(drop=True)
+        
+        return best_per_detector[['detector', metric, 'model_params'] + 
+                                  [col for col in self.results.columns if col not in ['detector', metric, 'model_params']]]
     
 
     
@@ -514,7 +576,7 @@ class AdvancedDetectionEvaluator:
         else:
             raise NotImplementedError(f"_normalize_scores in AdvancedDetectionEvaluator with {method=}")
     
-    def calculate_binary_metrics(self, predictions, ground_truth):
+    def calculate_binary_metrics(self, predictions, ground_truth, simulation_ids):
         """Расчет бинарных метрик с правильными формулами"""
         
         tn, fp, fn, tp = confusion_matrix(ground_truth, predictions).ravel()
@@ -528,7 +590,7 @@ class AdvancedDetectionEvaluator:
         # не 1 - precision
         # specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # Specificity = 1 - FDR
 
-        detection_latency = self.calculate_detection_latency(predictions, ground_truth)
+        detection_latency = self.calculate_detection_latency(predictions, ground_truth, simulation_ids)
         # TODO - для разных методов адаптировать скоры (нормализовать, например)
         
         return {
@@ -541,26 +603,31 @@ class AdvancedDetectionEvaluator:
             'confusion_matrix': [tn, fp, fn, tp]
         }
     
-    def calculate_detection_latency(self, predictions, ground_truth):
-      y = pd.Series(ground_truth)
-      pred = pd.Series(predictions)
-      y_segments = (y != y.shift()).cumsum()
-      position_in_segment = y.groupby(y_segments).cumcount()
-      anomaly_mask = (y == 1)
-      
-      if not anomaly_mask.any():
+    def calculate_detection_latency(self, predictions, ground_truth, simulation_ids):
+        y = pd.Series(ground_truth)
+        pred = pd.Series(predictions)
+        
+        if simulation_ids is not None:
+            sim_id = pd.Series(simulation_ids)
+            y_segments = (y != y.shift()).cumsum()
+            segment_key = y_segments.astype(str) + "_" + sim_id.astype(str)
+        else:
+            segment_key = (y != y.shift()).cumsum()
+        
+        position_in_segment = y.groupby(segment_key).cumcount()
+        anomaly_mask = (y == 1)
+        
+        if not anomaly_mask.any():
           return float('inf')
-      
-      anomaly_data = pd.DataFrame({
-          'segment_id': y_segments[anomaly_mask],
+        anomaly_data = pd.DataFrame({
+          'segment_key': segment_key[anomaly_mask],
           'position': position_in_segment[anomaly_mask],
           'prediction': pred[anomaly_mask]
-      })
-      
-      # Находим первое обнаружение в каждом сегменте
-      first_detections = anomaly_data[anomaly_data['prediction'] == 1].groupby('segment_id')['position'].first()
-      
-      return first_detections.mean() if len(first_detections) > 0 else float('inf')
+        })
+        # Находим первое обнаружение в каждом сегменте
+        first_detections = anomaly_data[anomaly_data['prediction'] == 1].groupby('segment_key')['position'].first()
+        
+        return first_detections.mean() if len(first_detections) > 0 else float('inf')
     
     
     def calculate_roc_analysis(self, scores, ground_truth):
@@ -568,17 +635,24 @@ class AdvancedDetectionEvaluator:
         roc_auc = auc(fpr, tpr)
         
         precision, recall, pr_thresholds = precision_recall_curve(ground_truth, scores)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
+        optimal_thr = pr_thresholds[np.argmax(f1)]
         pr_auc = auc(recall, precision)
         
         return {
             'roc_auc': roc_auc,
-            'pr_auc': pr_auc
+            'pr_auc': pr_auc,
+            'optimal_thr': optimal_thr,
         }
     
-    def calculate_metrics(self, scores, ground_truth, *args, **kwargs):
+    def calculate_metrics(self, scores, ground_truth, *args, simulation_ids=None, **kwargs):
         results = self.calculate_roc_analysis(scores, ground_truth)
-        results["detection_latency_75"] = self.calculate_detection_latency((scores > 0.75), ground_truth)
-        results["detection_latency_90"] = self.calculate_detection_latency((scores > 0.90), ground_truth)
+        thr = results["optimal_thr"]
+        results["detection_latency"] = self.calculate_detection_latency((scores > thr), ground_truth, simulation_ids)
+        # results["detection_latency_90"] = self.calculate_detection_latency((scores > 0.90), ground_truth, simulation_ids)
+        surv_metrics = self.calculate_survival_metrics((scores > thr), ground_truth, simulation_ids)
+        results["survival_mttd"] = surv_metrics["mttd"]
+        results["survival_km"] = surv_metrics["km_estimator"]
         return results
 
     def calculate_3d_roc_surface(self, scores, ground_truth, latency_windows=None):
@@ -619,4 +693,77 @@ class AdvancedDetectionEvaluator:
                 adapted_gt[i:i+latency_window] = 1
                 
         return adapted_gt
+
+    def calculate_survival_metrics(self, predictions, ground_truth, simulation_ids=None, max_time=20, thr=None): #надо ли здесь тоже параметризовать
+        """
+        Оценивает функцию выживаемости S(t) и среднее время до обнаружения (MTTD)
+        с учётом цензурированных аномалий.
+
+        S(t)=P(T>t) - вероятность того, что аномалия остается необнаруженной дольше времени t
+        Возвращает словарь с
+        - 'km_estimator': обученный объект KaplanMeierFitter (содержит S(t))
+        - 'mttd': среднее время до обнаружения (float)
+        - 'survival_table': DataFrame с временами и вероятностями выживаемости
+        - 'rmst' - площадь под кривой выживаемости
+        """
+        y = pd.Series(ground_truth)
+        pred = pd.Series(predictions)
+
+        if simulation_ids is not None:
+            sim_id = pd.Series(simulation_ids)
+            y_segments = (y != y.shift()).cumsum()
+            segment_key = y_segments.astype(str) + "_" + sim_id.astype(str)
+        else:
+            segment_key = (y != y.shift()).cumsum()
+
+
+        times = []
+        events = []
+        for key, group in y.groupby(segment_key):
+            if group.iloc[0] == 0:
+                continue
+
+            segment_length = len(group)
+            pred_seg = pred.loc[group.index]
+
+            detection_positions = np.where(pred_seg == 1)[0]
+            if len(detection_positions) > 0:
+                time = detection_positions[0] + 1
+                event = 1
+            else:
+                # Цензурирование: аномалия не обнаружена до конца сегмента
+                time = segment_length
+                event = 0
+            times.append(time)
+            events.append(event)
+
+        if not times:
+            return {'km_estimator': None, 'mttd': float('inf'), 'rmst': None}
+
+        kmf = KaplanMeierFitter()
+        kmf.fit(times, event_observed=events)
+
+        # Вычисление MTTD как интеграла S(t) dt (сумма для дискретных времён)
+        # max_time = max(times)
+        t_grid = np.arange(1, max_time + 1)
+        survival_probs = kmf.survival_function_at_times(t_grid).fillna(0).values
+        mttd = np.sum(survival_probs)
+
+        # Таблица выживаемости для возврата
+        survival_table = kmf.survival_function_.reset_index()
+        survival_table.columns = ['time', 'survival_probability']
+
+        times = kmf.survival_function_.index.values
+        surv = kmf.survival_function_.values.flatten()
+        max_time = min(max_time, len(predictions))
+        full_times = np.arange(1, max_time + 1)
+        surv_interp = np.interp(full_times, times, surv, left=1, right=0)
+        rmst = np.sum(surv_interp) # restricted_mean_survival_time - площадь под кривой выживаемости
+
+        return {
+            'km_estimator': kmf,
+            'mttd': mttd,
+            'rmst': rmst,
+            # 'survival_table': survival_table
+        }
 
