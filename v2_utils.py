@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 import numpy as np
 import os
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_auc_score
+import traceback
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_auc_score, precision_recall_curve, roc_curve, auc
+
 from sklearn.preprocessing import StandardScaler
 from typing import List, Tuple, Optional, Dict, Any, Union
 
@@ -345,227 +347,6 @@ class CSVDataLoader:
         return X, y
 
 
-class DetectionEvaluator:
-    def __init__(self, delay_window=10):
-        self.delay_window = delay_window
-    
-    def add_detection_delay(self, ground_truth):
-        delayed_gt = ground_truth.copy()
-        for i in range(len(ground_truth)):
-            if ground_truth[i]:
-                delayed_gt[i:min(len(ground_truth), i+self.delay_window)] = True
-        return delayed_gt
-    
-    def calculate_binary_metrics(self, predictions, ground_truth, apply_delay=True):
-        if apply_delay:
-            ground_truth = self.add_detection_delay(ground_truth)
-        
-        precision = precision_score(ground_truth, predictions, zero_division=0)
-        recall = recall_score(ground_truth, predictions, zero_division=0)
-        f1 = f1_score(ground_truth, predictions, zero_division=0)
-        accuracy = accuracy_score(ground_truth, predictions)
-        
-        return {
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1,
-            'accuracy': accuracy,
-        }
-    def calculate_metrics(self, scores, ground_truth, apply_delay=True):
-        if apply_delay:
-            ground_truth = self.add_detection_delay(ground_truth)
-        roc_auc = roc_auc_score(ground_truth, scores)
-        return {
-            "roc_auc" : roc_auc
-        }
-
-
-class BaseAnomalyDetector:
-    def __init__(self, model_class, **params):
-        self.model_class = model_class
-        self.params = params
-        self.model = None
-    
-    def fit(self, X):
-        self.model = self.model_class(**self.params)
-        if hasattr(self.model, 'fit'):
-            self.model.fit(X)
-        else:
-            raise NotImplementedError()
-        return self
-    
-    def predict_scores(self, X):
-        if self.model is None:
-            raise ValueError()
-        if isinstance(self.model, LocalOutlierFactor):
-            if self.model.novelty:  # ← проверяем режим
-                scores = -self.model.decision_function(X)
-            else:
-                scores = -self.model.negative_outlier_factor_
-        elif hasattr(self.model, "decision_function"):
-            scores = -self.model.decision_function(X)
-        elif hasattr(self.model, "score_samples"): 
-            scores = -self.model.score_samples(X)
-        else:
-            raise NotImplementedError()
-
-        if hasattr(self.model, '_raw_scores_fitted'):
-            min_score = self.model._min_score
-            max_score = self.model._max_score
-            normalized = (scores - min_score) / (max_score - min_score)
-            normalized = np.clip(normalized, 0, 1)
-        else:
-            normalized = 1 / (1 + np.exp(-scores / np.std(scores)))
-        
-        return normalized
-    
-    def get_params(self):
-        return self.params
-    
-    def set_params(self, **params):
-        self.params.update(params)
-        return self
-
-class ExperimentRunner:    
-    def __init__(self, data_generator, evaluator=DetectionEvaluator):
-        self.data_generator = data_generator
-        self.detectors = {}
-        self.results = []
-        self.evaluator = evaluator
-    
-    def register_detector(self, name, model_class, default_params=None):
-        if default_params is None:
-            default_params = {}
-        self.detectors[name] = {'class': model_class, 'default_params': default_params}
-    
-    
-    def run_single_experiment(self, detector_name, X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
-                            detector_params=None, delays=None, thresholds=None):
-        if hasattr(y_train, 'values'):
-            y_train = y_train.values
-        if hasattr(y_test, 'values'):
-            y_test = y_test.values
-        # if delays is None:
-        #     delays = [0, 1, 2, 5, 10]
-        if detector_params is None:
-            detector_params = self.detectors[detector_name]['default_params']
-        
-        detector = BaseAnomalyDetector(
-            self.detectors[detector_name]['class'], 
-            **detector_params
-        )
-        
-        try:
-            
-            detector.model = detector.model_class(**detector_params)
-            if detector_name == 'GradientBoosting':
-                detector.model.fit(X_train, y_train)
-            else:
-                detector.model.fit(X_train)
-            scores = detector.predict_scores(X_test)
-            # print(f"{detector_name=}: range=[{scores.min():.3f}, {scores.max():.3f}], "
-            #       f"mean={scores.mean():.3f}, std={scores.std():.3f}, "
-            #       f"p50={np.median(scores):.3f}, p75={np.percentile(scores, 75):.3f}, p90={np.percentile(scores, 90):.3f}")            
-            experiment_results = []
-            evaluator = self.evaluator()
-            
-            metrics = evaluator.calculate_metrics(scores, y_test, apply_delay=False, simulation_ids=sim_ids_test)
-            experiment_results.append({
-                'detector': detector_name,
-                # 'delay': delay,
-                **metrics,
-                **detector_params,
-            })
-            
-            return experiment_results
-            
-        except Exception as e:
-            print(f"Ошибка в эксперименте {detector_name}: {e}")
-            return []
-    
-    def run_comprehensive_experiments(self, model_params_list, window=30,
-                                    train_size=0.7, test_delays=None, custom_thresholds=None, autoencoder=None, random_state=42):
-        if test_delays is None:
-            test_delays = [0, 1, 2, 5, 10, 15, 20]
-        
-        all_results = []
-
-        dataset, target, simulation_ids = self.data_generator.get_full_data(get_simulation_ids=True, window=window)
-
-        if autoencoder is not None:
-            print(f"Применяем автоэнкодер к данным. Исходная форма: {dataset.shape}")
-            dataset_tensor = torch.FloatTensor(dataset.values if hasattr(dataset, 'values') else dataset)
-            dataset = autoencoder.encode(dataset_tensor).detach().cpu().numpy()
-            print(f"После автоэнкодера: {dataset.shape}")
-
-        X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
-            dataset, target, simulation_ids,
-            train_size=train_size, 
-            random_state=random_state,
-            shuffle=False, # по-хорошему не надо перемешивать
-            # stratify=target
-        )
-        y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
-        sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else si
-        print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")
-            
-        
-        for detector_name in self.detectors.keys():                
-            if detector_name in model_params_list:
-                param_combinations = model_params_list[detector_name]
-            else:
-                param_combinations = [{}]
-            
-            for params in param_combinations:
-                results = self.run_single_experiment(
-                    detector_name, 
-                    X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
-                    # dataset, target,
-                    detector_params=params, delays=test_delays,
-                    thresholds=custom_thresholds,
-                    # autoencoder=autoencoder
-                )
-                # print(results)
-                
-                for result in results:
-                    result.update({
-                        'freq': "3min",
-                        'size': len(dataset),
-                        'anomaly_ratio': np.mean(target),
-                        'model_params': params
-                    })
-                    
-                all_results.extend(results)
-        
-        self.results = pd.DataFrame(all_results)
-        return self.results
-    
-    
-    
-    def get_best_models(self, metric='roc_auc', top_k=5):
-        return (self.results.nlargest(top_k, metric))
-
-    def get_best_per_detector(self, metric='pr_auc'):
-        """
-        Возвращает таблицу с лучшими параметрами для каждого детектора по указанной метрике
-        """
-        if self.results is None or self.results.empty:
-            return pd.DataFrame()
-        
-        best_per_detector = self.results.loc[
-            self.results.groupby('detector')[metric].idxmax()
-        ].reset_index(drop=True)
-        
-        return best_per_detector[['detector', metric, 'model_params'] + 
-                                  [col for col in self.results.columns if col not in ['detector', metric, 'model_params']]]
-    
-
-    
-
-import numpy as np
-import pandas as pd
-from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score, confusion_matrix, roc_curve, auc, precision_recall_curve
-
 class AdvancedDetectionEvaluator:
     def __init__(self, **kwargs):
         pass
@@ -585,30 +366,28 @@ class AdvancedDetectionEvaluator:
         recall = recall_score(ground_truth, predictions, zero_division=0)  # TDR = Recall
         f1 = f1_score(ground_truth, predictions, zero_division=0)
         accuracy = accuracy_score(ground_truth, predictions)
-        
-        fdr = fp / (fp + tn) if (fp + tn) > 0 else 0  # False Detection Rate = False Positive Rate # False Alarm Rate - то же самое
-        # не 1 - precision
-        # specificity = tn / (tn + fp) if (tn + fp) > 0 else 0  # Specificity = 1 - FDR
+        far = fp / (fp + tn) if (fp + tn) > 0 else 0
+        fdr = tp / (tp + fn) if (tp + fn) > 0 else 0  # False Detection Rate 
 
         detection_latency = self.calculate_detection_latency(predictions, ground_truth, simulation_ids)
-        # TODO - для разных методов адаптировать скоры (нормализовать, например)
         
         return {
             'precision': precision,
-            'recall': recall,  # TDR (True Detection Rate)
+            'recall': recall,
             'f1_score': f1,
             'accuracy': accuracy,
-            'fdr': fdr, # False Detection Rate = FP / (FP + TN)
+            'fdr': fdr,
+            'far' : far,
             'detection_latency': detection_latency,
-            'confusion_matrix': [tn, fp, fn, tp]
+            # 'confusion_matrix': [tn, fp, fn, tp]
         }
     
     def calculate_detection_latency(self, predictions, ground_truth, simulation_ids):
-        y = pd.Series(ground_truth)
-        pred = pd.Series(predictions)
+        y = pd.Series(ground_truth).reset_index(drop=True)
+        pred = pd.Series(predictions).reset_index(drop=True)
         
         if simulation_ids is not None:
-            sim_id = pd.Series(simulation_ids)
+            sim_id = pd.Series(simulation_ids).reset_index(drop=True)
             y_segments = (y != y.shift()).cumsum()
             segment_key = y_segments.astype(str) + "_" + sim_id.astype(str)
         else:
@@ -620,7 +399,7 @@ class AdvancedDetectionEvaluator:
         if not anomaly_mask.any():
           return float('inf')
         anomaly_data = pd.DataFrame({
-          'segment_key': segment_key[anomaly_mask],
+          'segment_key': segment_key[anomaly_mask].values,
           'position': position_in_segment[anomaly_mask],
           'prediction': pred[anomaly_mask]
         })
@@ -645,12 +424,16 @@ class AdvancedDetectionEvaluator:
             'optimal_thr': optimal_thr,
         }
     
-    def calculate_metrics(self, scores, ground_truth, *args, simulation_ids=None, **kwargs):
+    def calculate_metrics(self, scores, ground_truth, optimal_thr=None, *args, simulation_ids=None, **kwargs):
         results = self.calculate_roc_analysis(scores, ground_truth)
-        thr = results["optimal_thr"]
-        results["detection_latency"] = self.calculate_detection_latency((scores > thr), ground_truth, simulation_ids)
+        if optimal_thr is None:
+            optimal_thr = results["optimal_thr"]
+        else:
+            results["optimal_thr"] = optimal_thr
+        results.update(self.calculate_binary_metrics((scores > optimal_thr), ground_truth, simulation_ids))
+        # results["detection_latency"] = self.calculate_detection_latency((scores > optimal_thr), ground_truth, simulation_ids)
         # results["detection_latency_90"] = self.calculate_detection_latency((scores > 0.90), ground_truth, simulation_ids)
-        surv_metrics = self.calculate_survival_metrics((scores > thr), ground_truth, simulation_ids)
+        surv_metrics = self.calculate_survival_metrics((scores > optimal_thr), ground_truth, simulation_ids)
         results["survival_mttd"] = surv_metrics["mttd"]
         results["survival_km"] = surv_metrics["km_estimator"]
         return results
@@ -766,4 +549,191 @@ class AdvancedDetectionEvaluator:
             'rmst': rmst,
             # 'survival_table': survival_table
         }
+
+
+class BaseAnomalyDetector:
+    def __init__(self, model_class, **params):
+        self.model_class = model_class
+        self.params = params
+        self.model = None
+    
+    def fit(self, X):
+        self.model = self.model_class(**self.params)
+        if hasattr(self.model, 'fit'):
+            self.model.fit(X)
+        else:
+            raise NotImplementedError()
+        return self
+    
+    def predict_scores(self, X):
+        if self.model is None:
+            raise ValueError()
+        if isinstance(self.model, LocalOutlierFactor):
+            if self.model.novelty:  # ← проверяем режим
+                scores = -self.model.decision_function(X)
+            else:
+                scores = -self.model.negative_outlier_factor_
+        elif hasattr(self.model, "decision_function"):
+            scores = -self.model.decision_function(X)
+        elif hasattr(self.model, "score_samples"): 
+            scores = -self.model.score_samples(X)
+        else:
+            raise NotImplementedError()
+
+        if hasattr(self.model, '_raw_scores_fitted'):
+            min_score = self.model._min_score
+            max_score = self.model._max_score
+            normalized = (scores - min_score) / (max_score - min_score)
+            normalized = np.clip(normalized, 0, 1)
+        else:
+            normalized = 1 / (1 + np.exp(-scores / np.std(scores)))
+        
+        return normalized
+    
+    def get_params(self):
+        return self.params
+    
+    def set_params(self, **params):
+        self.params.update(params)
+        return self
+
+class ExperimentRunner:    
+    def __init__(self, data_generator, evaluator=AdvancedDetectionEvaluator):
+        self.data_generator = data_generator
+        self.detectors = {}
+        self.results = []
+        self.evaluator = evaluator
+    
+    def register_detector(self, name, model_class, default_params=None):
+        if default_params is None:
+            default_params = {}
+        self.detectors[name] = {'class': model_class, 'default_params': default_params}
+    
+    
+    def run_single_experiment(self, detector_name, X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
+                            detector_params=None, delays=None, thresholds=None):
+        if hasattr(y_train, 'values'):
+            y_train = y_train.values
+        if hasattr(y_test, 'values'):
+            y_test = y_test.values
+        # if delays is None:
+        #     delays = [0, 1, 2, 5, 10]
+        if detector_params is None:
+            detector_params = self.detectors[detector_name]['default_params']
+        
+        detector = BaseAnomalyDetector(
+            self.detectors[detector_name]['class'], 
+            **detector_params
+        )
+        
+        try:
+            
+            detector.model = detector.model_class(**detector_params)
+            if detector_name == 'GradientBoosting':
+                detector.model.fit(X_train, y_train)
+            else:
+                detector.model.fit(X_train)
+            scores = detector.predict_scores(X_test)
+            train_scores = detector.predict_scores(X_train)
+            # print(f"{detector_name=}: range=[{scores.min():.3f}, {scores.max():.3f}], "
+            #       f"mean={scores.mean():.3f}, std={scores.std():.3f}, "
+            #       f"p50={np.median(scores):.3f}, p75={np.percentile(scores, 75):.3f}, p90={np.percentile(scores, 90):.3f}")            
+            experiment_results = []
+            evaluator = self.evaluator()
+            scores = (pd.Series(scores.values if hasattr(scores, 'values') else scores)).reset_index(drop=True)
+            train_scores = (pd.Series(train_scores.values if hasattr(train_scores, 'values') else train_scores)).reset_index(drop=True)
+
+            train_metrics = evaluator.calculate_metrics(train_scores, y_train, apply_delay=False, simulation_ids=sim_ids_train)
+            
+            metrics = evaluator.calculate_metrics(scores, y_test, optimal_thr=train_metrics["optimal_thr"], apply_delay=False, simulation_ids=sim_ids_test)
+            experiment_results.append({
+                'detector': detector_name,
+                # 'delay': delay,
+                **metrics,
+                **detector_params,
+            })
+            
+            return experiment_results
+            
+        except Exception as e:
+            print(f"Ошибка в эксперименте {detector_name}: {e}")
+            traceback.print_exc()
+            return []
+    
+    def run_comprehensive_experiments(self, model_params_list, window=30,
+                                    train_size=0.7, test_delays=None, custom_thresholds=None, autoencoder=None, random_state=42):
+        if test_delays is None:
+            test_delays = [0, 1, 2, 5, 10, 15, 20]
+        
+        all_results = []
+
+        dataset, target, simulation_ids = self.data_generator.get_full_data(get_simulation_ids=True, window=window)
+
+        if autoencoder is not None:
+            print(f"Применяем автоэнкодер к данным. Исходная форма: {dataset.shape}")
+            dataset_tensor = torch.FloatTensor(dataset.values if hasattr(dataset, 'values') else dataset)
+            dataset = autoencoder.encode(dataset_tensor).detach().cpu().numpy()
+            print(f"После автоэнкодера: {dataset.shape}")
+
+        X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
+            dataset, target, simulation_ids,
+            train_size=train_size, 
+            random_state=random_state,
+            shuffle=False, # по-хорошему не надо перемешивать
+            # stratify=target
+        )
+        y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
+        sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else sim_ids_test
+        print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")
+            
+        
+        for detector_name in self.detectors.keys():                
+            if detector_name in model_params_list:
+                param_combinations = model_params_list[detector_name]
+            else:
+                param_combinations = [{}]
+            
+            for params in param_combinations:
+                results = self.run_single_experiment(
+                    detector_name, 
+                    X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
+                    # dataset, target,
+                    detector_params=params, delays=test_delays,
+                    thresholds=custom_thresholds,
+                    # autoencoder=autoencoder
+                )
+                # print(results)
+                
+                for result in results:
+                    result.update({
+                        'freq': "3min",
+                        'size': len(dataset),
+                        'anomaly_ratio': np.mean(target),
+                        'model_params': params
+                    })
+                    
+                all_results.extend(results)
+        
+        self.results = pd.DataFrame(all_results)
+        return self.results
+    
+    
+    
+    def get_best_models(self, metric='roc_auc', top_k=5):
+        return (self.results.nlargest(top_k, metric))
+
+    def get_best_per_detector(self, metric='pr_auc'):
+        """
+        Возвращает таблицу с лучшими параметрами для каждого детектора по указанной метрике
+        """
+        if self.results is None or self.results.empty:
+            return pd.DataFrame()
+        
+        best_per_detector = self.results.loc[
+            self.results.groupby('detector')[metric].idxmax()
+        ].reset_index(drop=True)
+        
+        return best_per_detector[['detector', metric, 'model_params'] + 
+                                  [col for col in self.results.columns if col not in ['detector', metric, 'model_params']]]
+    
 

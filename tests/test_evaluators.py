@@ -10,7 +10,7 @@ import pytest
 import numpy as np
 import pandas as pd
 
-from v2_utils import AdvancedDetectionEvaluator, DetectionEvaluator
+from v2_utils import AdvancedDetectionEvaluator
 
 
 class TestAdvancedDetectionEvaluator:
@@ -83,8 +83,9 @@ class TestAdvancedDetectionEvaluator:
         results = evaluator.calculate_metrics(scores, ground_truth, simulation_id=sim_id)
         
         assert 'roc_auc' in results
-        assert 'detection_latency_75' in results
-        assert 'detection_latency_90' in results
+        assert 'detection_latency' in results
+        assert 'pr_auc' in results
+        assert 'f1_score' in results
 
     def test_survival_metrics_simple(self, evaluator):
         """Тест базовых метрик выживаемости: все аномалии обнаружены"""
@@ -136,65 +137,28 @@ class TestAdvancedDetectionEvaluator:
         ground_truth = np.array([0, 0, 1, 1, 1, 1])
         predictions = (scores > 0.75).astype(int)
         
-        # Мокаем calculate_roc_analysis и calculate_detection_latency
-        # Но проверим, что ключи есть
-        results = evaluator.calculate_metrics(scores, ground_truth)
+        results = evaluator.calculate_metrics(scores, ground_truth, optimal_thr=0.75)
         
         assert 'survival_mttd' in results
-        assert 'survival_rmst' in results
-        assert 'detection_latency_75' in results
-        assert 'detection_latency_90' in results
+        assert 'detection_latency' in results
+        assert 'optimal_thr' in results
 
-
-class TestDetectionEvaluator:
-    
-    @pytest.fixture
-    def evaluator(self):
-        return DetectionEvaluator(delay_window=5)
-    
-    def test_add_detection_delay(self, evaluator):
-        """Тест добавления окна задержки"""
-        ground_truth = np.array([0,0,1,0,0,0,0])
-        delayed = evaluator.add_detection_delay(ground_truth)
-        
-        expected = np.array([0,0,1,1,1,1,1])
-        # assert np.array_equal(delayed, expected)
-        np.testing.assert_array_equal(delayed, expected, 
-                                   err_msg=f"\n delayed: {delayed}\n expected: {expected}")
-    
-    def test_add_detection_delay_boundary(self, evaluator):
-        """Тест на границе массива"""
-        ground_truth = np.array([0,0,1,0,0])
-        delayed = evaluator.add_detection_delay(ground_truth)
-        # delay_window=5, но массив короче -> должно быть True до конца
-        expected = np.array([0,0,1,1,1])
-        assert np.array_equal(delayed, expected)
-    
     def test_calculate_binary_metrics(self, evaluator):
         """Тест бинарных метрик"""
         predictions = np.array([1,0,1,0,1,0,1])
         ground_truth = np.array([1,1,0,0,1,1,0])
+        sim_id = np.array([0,0,1,1,1,1,2])
         
-        metrics = evaluator.calculate_binary_metrics(predictions, ground_truth)
+        metrics = evaluator.calculate_binary_metrics(predictions, ground_truth, simulation_ids=sim_id)
         
         assert 'precision' in metrics
         assert 'recall' in metrics
         assert 'f1_score' in metrics
         assert 'accuracy' in metrics
         
-        assert 0 <= metrics['precision'] <= 1
-        assert 0 <= metrics['recall'] <= 1
-        assert 0 <= metrics['f1_score'] <= 1
-    
-    def test_calculate_metrics(self, evaluator):
-        """Тест calculate_metrics для ROC-AUC"""
-        scores = np.array([0.1, 0.2, 0.8, 0.9])
-        ground_truth = np.array([0, 0, 1, 1])
-        
-        metrics = evaluator.calculate_metrics(scores, ground_truth)
-        
-        assert 'roc_auc' in metrics
-        assert 0 <= metrics['roc_auc'] <= 1
+        assert np.isclose(metrics['precision'], 0.5)
+        assert np.isclose(metrics['recall'], 0.5)
+        assert np.isclose(metrics['f1_score'], 0.5)
 
 
 # Параметризованные тесты

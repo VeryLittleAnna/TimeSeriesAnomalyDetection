@@ -8,18 +8,20 @@ import pytest
 import numpy as np
 import pandas as pd
 
-from v2_utils import ExperimentRunner, DetectionEvaluator
+from v2_utils import ExperimentRunner, AdvancedDetectionEvaluator
+from sklearn.model_selection import train_test_split
 
 
 class MockDataGenerator:
     """Мок-генератор данных для тестирования ExperimentRunner"""
     
-    def __init__(self, X=None, y=None, sim_ids=None):
+    def __init__(self, X=None, y=None, sim_ids=None, window=None):
         self.X = X if X is not None else np.random.randn(100, 5)
         self.y = y if y is not None else np.random.randint(0, 2, 100)
         self.sim_ids = sim_ids if sim_ids is not None else np.zeros(100)
+        self.window = window
     
-    def get_full_data(self, get_simulation_ids=False):
+    def get_full_data(self, get_simulation_ids=False, window=None):
         if get_simulation_ids:
             return self.X, self.y, self.sim_ids
         return self.X, self.y
@@ -37,6 +39,12 @@ class MockDetector:
     def predict_scores(self, X):
         return np.random.random(len(X))
 
+    def decision_function(self, X):
+        return -np.random.rand(len(X))
+    
+    def score_samples(self, X):
+        return -np.random.rand(len(X))
+
 
 class TestExperimentRunner:
     
@@ -49,7 +57,7 @@ class TestExperimentRunner:
     
     @pytest.fixture
     def runner(self, mock_generator):
-        return ExperimentRunner(mock_generator, evaluator=DetectionEvaluator)
+        return ExperimentRunner(mock_generator, evaluator=AdvancedDetectionEvaluator)
     
     def test_register_detector(self, runner):
         """Тест регистрации детектора"""
@@ -69,9 +77,10 @@ class TestExperimentRunner:
         """Тест базового запуска одного эксперимента"""
         runner.register_detector('mock', MockDetector)
         X, y, sim_ids = mock_generator.get_full_data(get_simulation_ids=True)
+        X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(X, y, sim_ids, train_size=0.7)
         
         results = runner.run_single_experiment(
-            'mock', X, y, simulation_ids=sim_ids,
+            'mock', X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test,
             detector_params={'test': 1}
         )
         
@@ -85,10 +94,10 @@ class TestExperimentRunner:
         """Тест использования параметров по умолчанию"""
         runner.register_detector('mock', MockDetector, {'default_param': 100})
         X, y, sim_ids = mock_generator.get_full_data(get_simulation_ids=True)
-        
+                
         results = runner.run_single_experiment(
-            'mock', X, y, simulation_ids=sim_ids,
-            detector_params=None  # Должны использоваться default_params
+            'mock', X, X, y, y, sim_ids, sim_ids,
+            detector_params=None
         )
         
         assert results[0]['default_param'] == 100
@@ -97,9 +106,10 @@ class TestExperimentRunner:
         """Тест: запуск с несуществующим детектором"""
         X = np.random.randn(50, 3)
         y = np.random.randint(0, 2, 50)
+        sim_ids = np.zeros_like(X)
         
         with pytest.raises(KeyError):
-            runner.run_single_experiment('unknown', X, y)
+            runner.run_single_experiment('unknown', X, X, y, y, sim_ids, sim_ids)
     
     def test_comprehensive_experiments(self, runner):
         """Тест комплексного эксперимента с разными параметрами"""
