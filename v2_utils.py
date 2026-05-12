@@ -13,7 +13,7 @@ from typing import List, Tuple, Optional, Dict, Any, Union
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -325,13 +325,6 @@ class CSVDataLoader:
 
         if self.normalize and not self.scaler_fitted:
             X = self._normalize_data(X)
-            
-        if self.shuffle:
-            indices = np.random.permutation(len(X))
-
-            X = X.iloc[indices] if hasattr(X, 'iloc') else X[indices]
-            y = y.iloc[indices] if hasattr(y, 'iloc') else y[indices]
-            simulation_ids = simulation_ids.iloc[indices]
         
         # Ограничение по количеству samples
         if max_samples is not None and max_samples < len(X):
@@ -412,6 +405,11 @@ class AdvancedDetectionEvaluator:
     def calculate_roc_analysis(self, scores, ground_truth):
         fpr, tpr, thresholds = roc_curve(ground_truth, scores)
         roc_auc = auc(fpr, tpr)
+        diff = (1 - tpr - fpr)
+        diff = np.where(np.isnan(diff), np.inf, diff)
+        eer_ind = np.nanargmin(np.absolute(diff))
+        eer_threshold = thresholds[eer_ind]
+        eer = (fpr[eer_ind] + (1 - tpr[eer_ind])) / 2
         
         precision, recall, pr_thresholds = precision_recall_curve(ground_truth, scores)
         f1 = 2 * (precision * recall) / (precision + recall + 1e-10)
@@ -422,6 +420,7 @@ class AdvancedDetectionEvaluator:
             'roc_auc': roc_auc,
             'pr_auc': pr_auc,
             'optimal_thr': optimal_thr,
+            'eer': eer,
         }
     
     def calculate_metrics(self, scores, ground_truth, optimal_thr=None, *args, simulation_ids=None, **kwargs):
@@ -651,6 +650,8 @@ class ExperimentRunner:
                 # 'delay': delay,
                 **metrics,
                 **detector_params,
+                'test_scores': np.array(scores.values),
+                'test_target': np.array(y_test)
             })
             
             return experiment_results
@@ -675,13 +676,19 @@ class ExperimentRunner:
             dataset = autoencoder.encode(dataset_tensor).detach().cpu().numpy()
             print(f"После автоэнкодера: {dataset.shape}")
 
-        X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
-            dataset, target, simulation_ids,
-            train_size=train_size, 
-            random_state=random_state,
-            shuffle=False, # по-хорошему не надо перемешивать
-            # stratify=target
-        )
+        gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
+        train_idx, test_idx = next(gss.split(dataset, target, groups=simulation_ids))
+        X_train, X_test = dataset[train_idx], dataset[test_idx]
+        y_train, y_test = target[train_idx], target[test_idx]
+        sim_ids_train, sim_ids_test = simulation_ids[train_idx], simulation_ids[test_idx]
+
+        # X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
+        #     dataset, target, simulation_ids,
+        #     train_size=train_size, 
+        #     random_state=random_state,
+        #     shuffle=False, # по-хорошему не надо перемешивать
+        #     # stratify=target
+        # )
         y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
         sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else sim_ids_test
         print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")

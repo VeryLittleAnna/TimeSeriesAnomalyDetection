@@ -86,6 +86,7 @@ class TestAdvancedDetectionEvaluator:
         assert 'detection_latency' in results
         assert 'pr_auc' in results
         assert 'f1_score' in results
+        assert 'eer' in results
 
     def test_survival_metrics_simple(self, evaluator):
         """Тест базовых метрик выживаемости: все аномалии обнаружены"""
