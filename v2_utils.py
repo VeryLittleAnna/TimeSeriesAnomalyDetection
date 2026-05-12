@@ -596,6 +596,7 @@ class BaseAnomalyDetector:
         self.params.update(params)
         return self
 
+
 class ExperimentRunner:    
     def __init__(self, data_generator, evaluator=AdvancedDetectionEvaluator):
         self.data_generator = data_generator
@@ -678,9 +679,10 @@ class ExperimentRunner:
 
         gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
         train_idx, test_idx = next(gss.split(dataset, target, groups=simulation_ids))
-        X_train, X_test = dataset[train_idx], dataset[test_idx]
-        y_train, y_test = target[train_idx], target[test_idx]
-        sim_ids_train, sim_ids_test = simulation_ids[train_idx], simulation_ids[test_idx]
+        
+        X_train, X_test = (dataset.iloc[train_idx], dataset.iloc[test_idx]) if hasattr(dataset, 'iloc') else (dataset[train_idx], dataset[test_idx])
+        y_train, y_test = (target.iloc[train_idx], target.iloc[test_idx]) if hasattr(target, 'iloc') else (target[train_idx], target[test_idx])
+        sim_ids_train, sim_ids_test = (simulation_ids.iloc[train_idx], simulation_ids.iloc[test_idx]) if hasattr(simulation_ids, "iloc") else (simulation_ids[train_idx], simulation_ids[test_idx])
 
         # X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
         #     dataset, target, simulation_ids,
