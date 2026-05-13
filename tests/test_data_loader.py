@@ -10,7 +10,7 @@ import tempfile
 import pandas as pd
 import numpy as np
 
-from v2_utils import CSVDataLoader
+from dataset_utils import CSVDataLoader
 
 
 @pytest.fixture
@@ -119,3 +119,74 @@ class TestCSVDataLoader:
         
         assert len(y) <= 50
         assert len(sim_ids) <= 50
+
+
+    def test_stride_via_init(self, create_test_csv_files):
+        """Тест stride через параметр __init__ (только с window)"""
+        _, anomaly_dir, normal_dir = create_test_csv_files
+        
+        loader1 = CSVDataLoader(
+            data_dir=anomaly_dir,
+            normal_dir=normal_dir,
+            stride=1
+        )
+        
+        loader3 = CSVDataLoader(
+            data_dir=anomaly_dir,
+            normal_dir=normal_dir,
+            stride=3
+        )
+        
+        # Без window stride не работает
+        X1, y1 = loader1.get_full_data(window=10)
+        X3, y3 = loader3.get_full_data(window=10)
+        
+        # С stride=3 данных должно быть меньше
+        assert len(y3) < len(y1)
+        assert abs(len(y3) - len(y1) // 3) <= 2
+    
+    def test_stride_via_get_full_data(self, create_test_csv_files):
+        """Тест stride через параметр get_full_data (только с window)"""
+        _, anomaly_dir, normal_dir = create_test_csv_files
+        
+        loader = CSVDataLoader(
+            data_dir=anomaly_dir,
+            normal_dir=normal_dir
+        )
+        
+        X1, y1 = loader.get_full_data(window=10, stride=1)
+        X2, y2 = loader.get_full_data(window=10, stride=2)
+        
+        # С stride=2 данных должно быть меньше
+        assert len(y2) < len(y1)
+        assert abs(len(y2) - len(y1) // 2) <= 1
+
+    def test_window_statistics(self, create_test_csv_files):
+        """Тест: проверка корректности вычисления статистик для окон"""
+        _, anomaly_dir, normal_dir = create_test_csv_files
+        
+        loader = CSVDataLoader(
+            data_dir=anomaly_dir,
+            normal_dir=normal_dir
+        )
+        
+        window_size = 10
+        
+        windows, y_windows = loader.get_full_data(window=window_size, extract_stats=False)
+        features, y_stats = loader.get_full_data(window=window_size, extract_stats=True)
+        
+        assert windows.shape[0] == features.shape[0]
+        assert features.shape[1] == windows.shape[2] * 23  # n_features * n_stats
+        
+        # Проверка mean для первого окна и первой фичи
+        manual_mean = np.mean(windows[0, :, 0])
+        computed_mean = features[0, 0]  # первый признак первой фичи
+        assert np.allclose(manual_mean, computed_mean)
+
+        manual_std = np.std(windows[0, :, 0])  # первое окно, все временные точки, первая фича
+        computed_std = features[0, 2 * windows.shape[2]]
+        assert np.allclose(manual_std, computed_std)
+        # # Проверка std для первого окна и первой фичи
+        # manual_std = np.std(windows[0, :, 0])
+        # computed_std = features[0, 1]  # второй признак первой фичи
+        # assert np.allclose(manual_std, computed_std)
