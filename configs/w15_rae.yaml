@@ -1,0 +1,49 @@
+# configs/experiment_config.yaml
+experiment:
+  name: "w15_rae"
+  timestamp: auto  # автоматически добавится
+  
+data:
+  data_dir_template: "./gen_data_large_warmup/gen_data_{}"
+  file_fraction: 0.1
+  anomaly_ratio: 0.10
+  max_samples: 100000
+  window: 15
+  extract_stats: 0
+
+autoencoder:
+  model_path: "./models/new_autoencoder_w15_v6.pth"
+  # модель инициализируется автоматически
+  
+# anomaly_numbers: [1, 2, 3, 4]
+anomaly_numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+
+detectors:
+  IsolationForest:
+    - n_estimators: 100
+      max_samples: 'auto'
+      contamination: 0.1
+      random_state: 42
+    - n_estimators: 200
+      max_samples: 0.8
+      contamination: 0.05
+      random_state: 42
+      
+  LocalOutlierFactor:
+    - n_neighbors: 10
+      contamination: 0.05
+      novelty: true
+    - n_neighbors: 20
+      contamination: 'auto'
+      novelty: true
+      
+  OneClassSVM:
+    - kernel: 'linear'
+      nu: 0.15
+    - kernel: 'linear'
+      nu: 0.10
+
+output:
+  results_path: "./results/cleared"
+  save_scores: true
+  save_plots: true
