@@ -354,6 +354,7 @@ class CSVDataLoader:
             windows = self._extract_window_stats_vectorized(windows)
         # windows = windows.transpose(0, 2, 1)
         assert(windows.shape[0] == y.shape[0])
+        windows = np.nan_to_num(windows, nan=0)
         return windows, y
 
     def save_windows_chunked(self, data_gen, output_dir, window=None, stride=None, chunk_size=5000):
