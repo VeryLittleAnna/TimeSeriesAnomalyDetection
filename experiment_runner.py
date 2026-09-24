@@ -98,7 +98,13 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
         window = config['data']['window']
         
         # Предполагаем, что есть метод from_pretrained
-        autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
+        # autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
+        try:
+            autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
+        except Exception as e:
+            logger.info(f"  ⚠ Не удалось загрузить как RecurrentAutoencoder: {e}")
+            logger.info(f"  Пробуем загрузить как VariationalRecurrentAutoencoder...")
+            autoencoder = VariationalRecurrentAutoencoder.from_pretrained(model_path)
         autoencoder.eval()
         logger.info(f"Loaded autoencoder from {model_path}")
     for handler in logger.handlers:
@@ -195,24 +201,28 @@ def run_experiments_by_anomaly(
         # print(f"{data_gen.extract_stats=}")
         
         runner = ExperimentRunner(data_gen, evaluator=AdvancedDetectionEvaluator)
-        
-        runner.register_detector(
-            'IsolationForest', 
-            IsolationForest,
-            {'random_state': 42, 'contamination': 0.1}
-        )
 
-        runner.register_detector(
-            'LocalOutlierFactor', 
-            LocalOutlierFactor,
-            {'contamination': 0.1, "novelty": True}
-        )
+    
+        if 'IsolationForest' in model_params_list:    
+            runner.register_detector(
+                'IsolationForest', 
+                IsolationForest,
+                {'random_state': 42, 'contamination': 0.1}
+            )
 
-        # runner.register_detector(
-        #     'OneClassSVM', 
-        #     OneClassSVM,
-        #     {'kernel': 'linear', 'nu': 0.1} # {'kernel': 'rbf', 'gamma': 'auto', 'nu': 0.1}
-        # )
+        if 'LocalOutlierFactor' in model_params_list:    
+            runner.register_detector(
+                'LocalOutlierFactor', 
+                LocalOutlierFactor,
+                {'contamination': 0.1, "novelty": True}
+            )
+
+        if 'OneClassSVM' in model_params_list:    
+            runner.register_detector(
+                'OneClassSVM', 
+                OneClassSVM,
+                {'kernel': 'linear', 'nu': 0.1} # {'kernel': 'rbf', 'gamma': 'auto', 'nu': 0.1}
+            )
         
         results = runner.run_comprehensive_experiments(
             model_params_list=model_params_list,

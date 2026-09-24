@@ -447,3 +447,115 @@ class CSVDataLoader:
         if get_simulation_ids:
             return X, y, simulation_ids
         return X, y
+
+
+
+class PredictiveWindowDataset(Dataset):
+    """
+    Dataset для предсказательных автоэнкодеров.
+    Создает пары (past_window, future_window).
+    """
+    
+    def __init__(
+        self,
+        data: Union[np.ndarray, pd.DataFrame],
+        window_size: int,
+        horizon: int,
+        stride: int = 1,
+        transform: Optional[callable] = None
+    ):
+        """
+        Args:
+            data: (total_length, input_dim)
+            window_size: длина прошлого окна
+            horizon: горизонт предсказания
+            stride: шаг скользящего окна
+        """
+        if isinstance(data, np.ndarray):
+            self.data = torch.from_numpy(data).float()
+        elif isinstance(data, torch.Tensor):
+            self.data = data.float()
+        else:
+            self.data = torch.FloatTensor(data) 
+        self.window_size = window_size
+        self.horizon = horizon
+        self.stride = stride
+        
+        self.total_length = len(self.data)
+        self.num_samples = max(0, (self.total_length - window_size - horizon) // stride + 1)
+        
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        start = idx * self.stride
+        past_end = start + self.window_size
+        future_end = past_end + self.horizon
+        
+        past = self.data[start:past_end]
+        future = self.data[past_end:future_end]
+        
+        return past, future
+
+
+def create_predictive_dataloaders(
+    data_path: str,
+    window_size: int,
+    horizon: int,
+    batch_size: int = 32,
+    train_ratio: float = 0.8,
+    stride: int = 1,
+    preload_to_ram: bool = True,
+    num_workers: int = 4
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Создает train/test dataloaders для предсказательных моделей.
+    
+    Args:
+        data_path: путь к .npy файлу с данными формы (total_length, input_dim)
+        window_size: длина прошлого окна
+        horizon: горизонт предсказания
+        batch_size: размер батча
+        train_ratio: доля тренировочных данных
+        stride: шаг скользящего окна
+        preload_to_ram: загружать ли данные в RAM
+        num_workers: количество процессов для DataLoader
+    """
+    import numpy as np
+    
+    # Загрузка данных
+    if preload_to_ram:
+        data = np.load(data_path)
+    else:
+        # Если файл слишком большой, используем memory mapping
+        data = np.load(data_path, mmap_mode='r')
+    
+    # Разделение на train/test
+    train_size = int(len(data) * train_ratio)
+    train_data = data[:train_size]
+    test_data = data[train_size:]
+    
+    # Создание датасетов
+    train_dataset = PredictiveWindowDataset(
+        train_data, window_size, horizon, stride
+    )
+    test_dataset = PredictiveWindowDataset(
+        test_data, window_size, horizon, stride
+    )
+    
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers
+    )
+    
+    return train_loader, test_loader

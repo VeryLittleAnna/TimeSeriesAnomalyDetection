@@ -14,6 +14,7 @@ from sklearn.neighbors import LocalOutlierFactor
 from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from torch.utils.data import DataLoader, TensorDataset
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -226,8 +227,8 @@ class AdvancedDetectionEvaluator:
         - 'survival_table': DataFrame с временами и вероятностями выживаемости
         - 'rmst' - площадь под кривой выживаемости
         """
-        y = pd.Series(ground_truth)
-        pred = pd.Series(predictions)
+        y = pd.Series(ground_truth).reset_index(drop=True)
+        pred = pd.Series(predictions).reset_index(drop=True)
 
         if simulation_ids is not None:
             sim_id = pd.Series(simulation_ids)
@@ -244,7 +245,9 @@ class AdvancedDetectionEvaluator:
                 continue
 
             segment_length = len(group)
-            pred_seg = pred.loc[group.index]
+            # pred_seg = pred.loc[group.index]
+            group_indices = group.index
+            pred_seg = pred.iloc[group_indices]
 
             detection_positions = np.where(pred_seg == 1)[0]
             if len(detection_positions) > 0:
@@ -334,6 +337,87 @@ class BaseAnomalyDetector:
         self.params.update(params)
         return self
 
+class AutoencoderReconstructionDetector(BaseAnomalyDetector):
+    """Детектор на основе ошибки реконструкции - работает с сырыми данными"""
+    
+    def __init__(self, autoencoder, reduction='mean', batch_size=256):
+        self.autoencoder = autoencoder
+        self.reduction = reduction
+        self.batch_size = batch_size
+        self._min_score = None
+        self._max_score = None
+        
+    def _compute_scores(self, X):
+        """Вычисляет ошибку реконструкции"""
+        self.autoencoder.eval()
+        
+        # Определяем устройство
+        # device = next(self.autoencoder.parameters()).device
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.autoencoder.to(device)
+        
+        # Преобразуем X в numpy если это DataFrame
+        if hasattr(X, 'values'):
+            X = X.values
+        
+        # Создаем DataLoader для эффективной обработки
+        data_tensor = torch.FloatTensor(X)
+        dataloader = DataLoader(
+            TensorDataset(data_tensor),
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=2 if device.type == 'cuda' else 0,
+            pin_memory=(device.type == 'cuda')
+        )
+        
+        reconstructed_batches = []
+        with torch.no_grad():
+            for (batch,) in dataloader:
+                batch = batch.to(device, non_blocking=True)
+                output = self.autoencoder(batch)  # autoencoder возвращает (reconstructed, latent) или (reconstructed, z, mu, log_var)
+                reconstructed = output[0]  # всегда берем первый элемент (реконструкция)
+                reconstructed_batches.append(reconstructed.detach().cpu().numpy())
+        torch.cuda.empty_cache()
+        
+        reconstructed = np.concatenate(reconstructed_batches, axis=0)
+        reconstructed = reconstructed[:len(X)]  # обрезаем до исходной длины
+        
+        # Вычисляем MSE
+        mse = ((X - reconstructed) ** 2).mean(axis=-1)  # mse.shape = (n_samples,)
+        
+        if self.reduction == 'mean':
+            scores = mse.mean(axis=1)
+        elif self.reduction == 'max':
+            scores = mse.max(axis=1)
+        else:
+            scores = mse.sum(axis=1)
+        self.autoencoder.cpu()
+        
+        return scores
+    
+    def fit(self, X):
+        scores = self._compute_scores(X)
+        self._min_score = scores.min()
+        self._max_score = scores.max()
+        return self
+    
+    def predict_scores(self, X):
+        scores = self._compute_scores(X)
+        
+        if self._min_score is not None and self._max_score is not None:
+            normalized = (scores - self._min_score) / (self._max_score - self._min_score + 1e-8)
+            normalized = np.clip(normalized, 0, 1)
+        else:
+            normalized = 1 / (1 + np.exp(-scores / (scores.std() + 1e-8)))
+        
+        return normalized
+    
+    def get_params(self):
+        return {
+            'reduction': self.reduction,
+            'batch_size': self.batch_size,
+            'type': 'autoencoder_reconstruction'
+        }
 
 class ExperimentRunner:    
     def __init__(self, data_generator, evaluator=AdvancedDetectionEvaluator):
@@ -408,34 +492,69 @@ class ExperimentRunner:
         all_results = []
 
         dataset, target, simulation_ids = self.data_generator.get_full_data(get_simulation_ids=True, window=window)
+        raw_dataset = dataset.copy() if autoencoder is not None else None
 
-        if autoencoder is not None:
-            print(f"Применяем автоэнкодер к данным. Исходная форма: {dataset.shape}")
-            dataset_tensor = torch.FloatTensor(dataset.values if hasattr(dataset, 'values') else dataset)
-            dataset = autoencoder.encode(dataset_tensor).detach().cpu().numpy()
-            print(f"После автоэнкодера: {dataset.shape}")
-
+        #split
         gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
         train_idx, test_idx = next(gss.split(dataset, target, groups=simulation_ids))
-        
         X_train, X_test = (dataset.iloc[train_idx], dataset.iloc[test_idx]) if hasattr(dataset, 'iloc') else (dataset[train_idx], dataset[test_idx])
         y_train, y_test = (target.iloc[train_idx], target.iloc[test_idx]) if hasattr(target, 'iloc') else (target[train_idx], target[test_idx])
         sim_ids_train, sim_ids_test = (simulation_ids.iloc[train_idx], simulation_ids.iloc[test_idx]) if hasattr(simulation_ids, "iloc") else (simulation_ids[train_idx], simulation_ids[test_idx])
-        # print(f"{np.isnan(X_train).mean()=}, {np.isnan(X_test).mean()=}")
-
-        # X_train, X_test, y_train, y_test, sim_ids_train, sim_ids_test = train_test_split(
-        #     dataset, target, simulation_ids,
-        #     train_size=train_size, 
-        #     random_state=random_state,
-        #     shuffle=False, # по-хорошему не надо перемешивать
-        #     # stratify=target
-        # )
         y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
         sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else sim_ids_test
         print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")
+
+        ##
+
+        if autoencoder is not None and 'AutoencoderReconstruction' in model_params_list:
+            # Берем сырые данные (не кодированные)
+            X_train_raw = raw_dataset.iloc[train_idx] if hasattr(raw_dataset, 'iloc') else raw_dataset[train_idx]
+            X_test_raw = raw_dataset.iloc[test_idx] if hasattr(raw_dataset, 'iloc') else raw_dataset[test_idx]
             
+            ae_params_list = model_params_list.get('AutoencoderReconstruction', [{'reduction': 'mean'}])
+
+            for params in ae_params_list:
+                ae_detector = AutoencoderReconstructionDetector(
+                    autoencoder=autoencoder,
+                    reduction=params.get('reduction', 'mean')
+                )
+                
+                ae_detector.fit(X_train_raw)
+                scores = ae_detector.predict_scores(X_test_raw)
+                train_scores = ae_detector.predict_scores(X_train_raw)
+                
+                evaluator = self.evaluator()
+                train_metrics = evaluator.calculate_metrics(train_scores, y_train, simulation_ids=sim_ids_train)
+                metrics = evaluator.calculate_metrics(scores, y_test, optimal_thr=train_metrics["optimal_thr"], simulation_ids=sim_ids_test)
+                
+                result = {
+                    'detector': 'AutoencoderReconstruction' + "_" + autoencoder.get_name(),
+                    **metrics,
+                    **params,
+                    'test_scores': np.array(scores),
+                    'test_target': np.array(y_test),
+                    'freq': "3min",
+                    'size': len(dataset),
+                    'anomaly_ratio': np.mean(target),
+                    'model_params': params
+                }
+                all_results.append(result)
+
+        # остальные детекторы с кодированием
+        if autoencoder is not None:
+            from autoencoders import encode_with_autoencoder
+            from vae import VariationalRecurrentAutoencoder
+            return_what = "mu" if isinstance(autoencoder, VariationalRecurrentAutoencoder) else None
+            dataset_encoded = encode_with_autoencoder(data=dataset, autoencoder=autoencoder, batch_size=256, return_what=return_what)
+            X_train = dataset_encoded.iloc[train_idx] if hasattr(dataset_encoded, 'iloc') else dataset_encoded[train_idx]
+            X_test = dataset_encoded.iloc[test_idx] if hasattr(dataset_encoded, 'iloc') else dataset_encoded[test_idx]
+        else:
+            X_train = X_train 
+            X_test = X_test
         
-        for detector_name in self.detectors.keys():                
+        for detector_name in self.detectors.keys(): 
+            if detector_name not in model_params_list:
+                continue
             if detector_name in model_params_list:
                 param_combinations = model_params_list[detector_name]
             else:

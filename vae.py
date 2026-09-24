@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import json
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List
+# from autoencoders import encsode_with_autoencoder
 
 @dataclass
 class ModelConfig:
@@ -56,6 +57,7 @@ class VariationalRecurrentAutoencoder(nn.Module):
             num_layers = config.num_layers
             rnn_type = config.rnn_type
             dropout = config.dropout
+            self.config = config
 
         self.input_dim = input_dim
         self.window_size = window_size
@@ -104,6 +106,9 @@ class VariationalRecurrentAutoencoder(nn.Module):
         )
 
         self.output_layer = nn.Linear(hidden_dim, input_dim)
+
+    def get_name(self):
+        return f"vae_w{self.window_size}"
 
     def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
         """
@@ -200,7 +205,9 @@ class VariationalRecurrentAutoencoder(nn.Module):
         model.load_state_dict(state_dict)
         return model
 
-    def save_pretrained(self, save_path: str, config: ModelConfig):
+    def save_pretrained(self, save_path: str, config: ModelConfig=None):
+        if config is None:
+            config = self.config
         torch.save(self.state_dict(), save_path)
 
         config_path = save_path.replace('.pth', '_config.json')
@@ -299,6 +306,7 @@ def train_one_epoch(
 
 def train_vrae(
     model: VariationalRecurrentAutoencoder,
+    config: ModelConfig,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     epochs: int = 50,
@@ -413,14 +421,15 @@ def train_vrae(
             # Сохраняем лучшую модель
             if saved_path is not None:
                 # Сохраняем состояние модели
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'train_metrics': train_metrics,
-                    'test_metrics': test_metrics,
-                    'best_loss': best_loss,
-                }, saved_path)
+                # torch.save({
+                #     'epoch': epoch,
+                #     'model_state_dict': model.state_dict(),
+                #     'optimizer_state_dict': optimizer.state_dict(),
+                #     'train_metrics': train_metrics,
+                #     'test_metrics': test_metrics,
+                #     'best_loss': best_loss,
+                # }, saved_path)
+                model.save_pretrained(saved_path, config)
                 print(f"  Модель сохранена в {saved_path} (loss: {best_loss:.6f})")
         else:
             no_improve += 1

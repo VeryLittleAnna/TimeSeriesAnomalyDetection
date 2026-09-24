@@ -1,10 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pandas as pd
+import numpy as np
 
 import json
 from dataclasses import dataclass, asdict
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
+
+from torch.utils.data import DataLoader, TensorDataset
 
 @dataclass
 class ModelConfig:
@@ -92,6 +96,9 @@ class RecurrentAutoencoder(nn.Module):
         self.output_layer = nn.Linear(hidden_dim, input_dim)
         
         self.decoder_hidden = None
+
+    def get_name(self):
+        return f"rae_w{self.window_size}"
         
     def encode(self, x):
         _, hidden = self.encoder_rnn(x)
@@ -170,3 +177,70 @@ class RecurrentAutoencoder(nn.Module):
         
         # print(f"Model saved to {save_path}")
         # print(f"Config saved to {config_path}")
+
+
+def encode_with_autoencoder(
+    data: Union[np.ndarray, pd.DataFrame],
+    autoencoder: torch.nn.Module,
+    return_what: Optional[str] = None, # "z", "mu", или "log_var"
+    batch_size: int = 256,
+    num_workers: int = 4,
+    device: Optional[torch.device] = None
+) -> np.ndarray:
+    """
+    Применяет автоэнкодер к данным с оптимальным батчированием.
+    
+    Args:
+        data: (N, seq_len, features)
+        autoencoder: Модель автоэнкодера с методом .encode()
+        return_what: что возвращать (для обычного AE - None, для VAE - mu)
+        batch_size: Размер батча (по умолчанию 256)
+        num_workers: Количество процессов для загрузки данных (0 для отключения)
+        device: Устройство (cuda/cpu). Если None, выбирается автоматически
+    Returns:
+        Закодированные данные в виде numpy array на CPU
+    """
+    if device is None:
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    
+    if isinstance(data, pd.DataFrame):
+        data_tensor = torch.FloatTensor(data.values)
+    elif isinstance(data, np.ndarray):
+        data_tensor = torch.FloatTensor(data)
+    
+    original_shape = data_tensor.shape
+    print(f"Кодирование автоэнкодером. Исходная форма: {original_shape}")
+    print(f"Устройство: {device}, batch_size: {batch_size}")
+    
+    autoencoder = autoencoder.to(device)
+    autoencoder.eval()
+    
+    dataset = TensorDataset(data_tensor)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers if device.type == 'cuda' else 0,
+        pin_memory=(device.type == 'cuda')
+    )
+    
+    encoded_batches = []
+    with torch.no_grad():
+        for (batch,) in dataloader:
+            batch = batch.to(device, non_blocking=True)
+            encoded_batch = autoencoder.encode(batch)
+            if return_what is None:
+                encoded_batch = encoded_batch
+            elif return_what == "z":
+                encoded_batch = encoded_batch[0]  # z
+            elif return_what == "mu":
+                encoded_batch = encoded_batch[1]  # mu
+            elif return_what == "log_var":
+                encoded_batch = encoded_batch[2]  # log_var
+            else:
+                raise ValueError(f"return_what должен быть 'z', 'mu' или 'log_var', получен {return_what}")
+            encoded_batches.append(encoded_batch.cpu())
+    
+    result = torch.cat(encoded_batches, dim=0).numpy()
+    print(f"После автоэнкодера: {result.shape}")
+    return result
