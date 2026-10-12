@@ -1,0 +1,52 @@
+experiment:
+  name: "tina_stats"
+
+data:
+  dataset_type: "tina"
+  data_dir: "./tina/data"
+  label_source: "alarms"
+  resample_seconds: 10
+  # проверочный
+  max_files: 500
+  rows_per_file: null
+  max_samples: 5000000
+
+  # 5 минут 
+  window: 30
+  stride: 1
+  extract_stats: true
+
+  train_size: 0.7
+  split_strategy: "chronological"
+  random_state: 42
+
+  scale_after_split: true
+
+  train_normal_only: true
+
+autoencoder:
+  model_path: null
+
+
+anomaly_numbers:
+  - "all"
+
+detectors:
+  IsolationForest:
+    - n_estimators: 100
+      max_samples: "auto"
+      contamination: "auto"
+      random_state: 42
+    - n_estimators: 200
+      max_samples: "auto"
+      contamination: "auto"
+      random_state: 42
+    - n_estimators: 200
+      max_samples: 0.8
+      contamination: 0.05
+      random_state: 42
+
+output:
+  results_path: "./results/tina"
+  save_scores: true
+  save_plots: true
