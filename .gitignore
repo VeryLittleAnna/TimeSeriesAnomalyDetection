@@ -1,7 +1,7 @@
 gen_data*/
 
 *.zip
-
+*.patch
 models/
 
 __pycache__/
