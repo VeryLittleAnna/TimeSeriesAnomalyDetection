@@ -12,6 +12,7 @@ import shutil
 import time
 import pandas as pd
 import numpy as np
+import joblib
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -24,6 +25,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from autoencoders import RecurrentAutoencoder
 from vae import VariationalRecurrentAutoencoder
+from loaders import Petrobras3WDataLoader, TiNADataLoader
 
 
 
@@ -118,12 +120,12 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
             logger=logger,
             **kwargs
         )
-    
+    summary["window"] = config.get("window", 1)
     # Запуск эксперимента
     try:
         summary, pivot = run_with_logging(
             anomaly_numbers=config['anomaly_numbers'],
-            data_dir_template=config['data']['data_dir_template'],
+            data_dir_template=config['data'].get('data_dir_template', ''),
             model_params_list=config['detectors'],
             file_fraction=config['data'].get('file_fraction', 0.01),
             anomaly_ratio=config['data'].get('anomaly_ratio', 0.11),
@@ -131,7 +133,11 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
             result_title=exp_name,
             window=config['data']['window'],
             autoencoder=autoencoder,
-            extract_stats=config['data'].get('extract_stats', 0)
+            extract_stats=config['data'].get('extract_stats', 0),
+            data_config=config['data'],
+            split_strategy=config['data'].get('split_strategy', 'group_random'),
+            scale_after_split=config['data'].get('scale_after_split', False),
+            train_normal_only=config['data'].get('train_normal_only', False),
         )
         
         logger.info(f"Experiment completed successfully")
@@ -149,6 +155,54 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
     except Exception as e:
         logger.error(f"Experiment failed: {str(e)}", exc_info=True)
         raise
+
+def build_data_loader(data_config: Dict[str, Any], anomaly_number):
+    """Create a loader without changing the model/evaluator API."""
+    dataset_type = data_config.get('dataset_type', 'tep').lower()
+
+    if dataset_type == 'tep':
+        data_dir_template = data_config['data_dir_template']
+        return CSVDataLoader(
+            data_dir_template.format(anomaly_number),
+            normal_dir=data_dir_template.format(0),
+            file_fraction=data_config.get('file_fraction', 0.01),
+            max_samples=data_config.get('max_samples'),
+            anomaly_ratio=data_config.get('anomaly_ratio', 0.11),
+            shuffle=True,
+            normalize=not data_config.get('scale_after_split', False),
+            extract_stats=data_config.get('extract_stats', False),
+        )
+
+    if dataset_type == 'tina':
+        if str(anomaly_number).lower() != 'all':
+            raise ValueError("TiNA pooled labels expect anomaly_numbers: ['all']")
+        return TiNADataLoader(
+            data_config['data_dir'],
+            label_source=data_config.get('label_source', 'alarms'),
+            resample_seconds=data_config.get('resample_seconds', 10),
+            max_files=data_config.get('max_files'),
+            rows_per_file=data_config.get('rows_per_file'),
+            max_samples=data_config.get('max_samples'),
+            stride=data_config.get('stride', 1),
+            extract_stats=data_config.get('extract_stats', False),
+        )
+
+    if dataset_type == '3w':
+        event_type = int(anomaly_number)
+        return Petrobras3WDataLoader(
+            data_config['data_dir'],
+            sources=tuple(data_config.get('sources', ['real'])),
+            event_types=[0, event_type],
+            feature_policy=data_config.get('feature_policy', 'intersection'),
+            drop_unlabeled=data_config.get('drop_unlabeled', True),
+            max_files=data_config.get('max_files'),
+            max_samples=data_config.get('max_samples'),
+            stride=data_config.get('stride', 1),
+            extract_stats=data_config.get('extract_stats', False),
+        )
+
+    raise ValueError(f"Unknown dataset_type={dataset_type!r}; use tep, tina or 3w")
+
 
 # def recreate_dir(path):
 #     if os.path.exists(path):
@@ -170,13 +224,16 @@ def run_experiments_by_anomaly(
         autoencoder=None,
         save_plots_dir: str = None, logger=None,
         extract_stats=False,
+        data_config=None,
+        split_strategy='group_random',
+        scale_after_split=False,
+        train_normal_only=False,
         **kwargs
     ):
     # timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
     # results_path = f"{results_path}/{timestamp}_{result_title if result_title else ""}"
     # recreate_dir(results_path)
     # timestamp = "-"
-    normal_dir = data_dir_template.format(0)
     all_best_models = []
     all_best_per_detector = []
     
@@ -186,18 +243,17 @@ def run_experiments_by_anomaly(
         logger.info(f"{'='*50}")
         start_time = time.time()
         
-        data_dir = data_dir_template.format(i)
-        
-        
-        data_gen = CSVDataLoader(data_dir, 
-                                 file_fraction=file_fraction,
-                                 normal_dir=normal_dir, 
-                                 max_samples=max_samples,
-                                 anomaly_ratio=anomaly_ratio,
-                                 shuffle=True,
-                                 normalize=True,
-                                 extract_stats=extract_stats
-                                )
+        if data_config is None:
+            data_config = {
+                'dataset_type': 'tep',
+                'data_dir_template': data_dir_template,
+                'file_fraction': file_fraction,
+                'anomaly_ratio': anomaly_ratio,
+                'max_samples': max_samples,
+                'extract_stats': extract_stats,
+                'scale_after_split': scale_after_split,
+            }
+        data_gen = build_data_loader(data_config, i)
         # print(f"{data_gen.extract_stats=}")
         
         runner = ExperimentRunner(data_gen, evaluator=AdvancedDetectionEvaluator)
@@ -229,7 +285,16 @@ def run_experiments_by_anomaly(
             test_delays=None,
             autoencoder=autoencoder,
             window=window,
+            train_size=data_config.get('train_size', 0.7),
+            random_state=data_config.get('random_state', 42),
+            split_strategy=split_strategy,
+            scale_after_split=scale_after_split,
+            train_normal_only=train_normal_only,
         )
+        if hasattr(runner, 'scaler'):
+            scaler_path = Path(results_path) / f"scaler_ANOM{i}.joblib"
+            joblib.dump(runner.scaler, scaler_path)
+            logger.info(f"Scaler saved to {scaler_path}")
         
         # filename = f"{results_path}/experiments_results_{i}.csv"
         # results.to_csv(filename, index=False)

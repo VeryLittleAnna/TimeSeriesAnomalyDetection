@@ -484,32 +484,72 @@ class ExperimentRunner:
             traceback.print_exc()
             return []
     
+    @staticmethod
+    def _chronological_group_split(groups, train_size):
+        groups = np.asarray(groups)
+        ordered_groups = pd.unique(groups)
+        if len(ordered_groups) < 2:
+            raise ValueError("Chronological split requires at least two sequences")
+        split_at = min(max(1, int(len(ordered_groups) * train_size)), len(ordered_groups) - 1)
+        train_groups = ordered_groups[:split_at]
+        test_groups = ordered_groups[split_at:]
+        return np.flatnonzero(np.isin(groups, train_groups)), np.flatnonzero(np.isin(groups, test_groups))
+
+    @staticmethod
+    def _standardize_after_split(X_train, X_test):
+        train_shape, test_shape = X_train.shape, X_test.shape
+        scaler = StandardScaler()
+        train_2d = np.asarray(X_train).reshape(-1, train_shape[-1])
+        test_2d = np.asarray(X_test).reshape(-1, test_shape[-1])
+        X_train = scaler.fit_transform(train_2d).reshape(train_shape).astype(np.float32)
+        X_test = scaler.transform(test_2d).reshape(test_shape).astype(np.float32)
+        return X_train, X_test, scaler
+
     def run_comprehensive_experiments(self, model_params_list, window=30,
-                                    train_size=0.7, test_delays=None, custom_thresholds=None, autoencoder=None, random_state=42):
+                                    train_size=0.7, test_delays=None, custom_thresholds=None,
+                                    autoencoder=None, random_state=42,
+                                    split_strategy='group_random', scale_after_split=False,
+                                    train_normal_only=False):
         if test_delays is None:
             test_delays = [0, 1, 2, 5, 10, 15, 20]
         
         all_results = []
 
         dataset, target, simulation_ids = self.data_generator.get_full_data(get_simulation_ids=True, window=window)
-        raw_dataset = dataset.copy() if autoencoder is not None else None
+        split_groups = (
+            self.data_generator.get_split_groups(simulation_ids)
+            if hasattr(self.data_generator, 'get_split_groups')
+            else simulation_ids
+        )
+        if split_strategy == 'chronological':
+            train_idx, test_idx = self._chronological_group_split(split_groups, train_size)
+        elif split_strategy == 'group_random':
+            gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
+            train_idx, test_idx = next(gss.split(dataset, target, groups=split_groups))
+        else:
+            raise ValueError("split_strategy must be 'chronological' or 'group_random'")
 
-        #split
-        gss = GroupShuffleSplit(n_splits=1, train_size=train_size, random_state=random_state)
-        train_idx, test_idx = next(gss.split(dataset, target, groups=simulation_ids))
+        if train_normal_only:
+            target_array = np.asarray(target, dtype=bool)
+            train_idx = train_idx[~target_array[train_idx]]
+            if len(train_idx) == 0:
+                raise ValueError("train_normal_only removed every training sample")
+
         X_train, X_test = (dataset.iloc[train_idx], dataset.iloc[test_idx]) if hasattr(dataset, 'iloc') else (dataset[train_idx], dataset[test_idx])
         y_train, y_test = (target.iloc[train_idx], target.iloc[test_idx]) if hasattr(target, 'iloc') else (target[train_idx], target[test_idx])
         sim_ids_train, sim_ids_test = (simulation_ids.iloc[train_idx], simulation_ids.iloc[test_idx]) if hasattr(simulation_ids, "iloc") else (simulation_ids[train_idx], simulation_ids[test_idx])
         y_test = y_test.reset_index(drop=True) if hasattr(y_test, 'reset_index') else y_test
         sim_ids_test = sim_ids_test.reset_index(drop=True) if hasattr(sim_ids_test, 'reset_index') else sim_ids_test
+        if scale_after_split:
+            X_train, X_test, self.scaler = self._standardize_after_split(X_train, X_test)
         print(f"{X_train.shape=}, {y_train.shape=}, {X_test.shape=}, {y_test.shape=}, {y_train.mean()=}, {y_test.mean()=}")
 
         ##
 
         if autoencoder is not None and 'AutoencoderReconstruction' in model_params_list:
             # Берем сырые данные (не кодированные)
-            X_train_raw = raw_dataset.iloc[train_idx] if hasattr(raw_dataset, 'iloc') else raw_dataset[train_idx]
-            X_test_raw = raw_dataset.iloc[test_idx] if hasattr(raw_dataset, 'iloc') else raw_dataset[test_idx]
+            X_train_raw = X_train.copy()
+            X_test_raw = X_test.copy()
             
             ae_params_list = model_params_list.get('AutoencoderReconstruction', [{'reduction': 'mean'}])
 
@@ -545,9 +585,8 @@ class ExperimentRunner:
             from autoencoders import encode_with_autoencoder
             from vae import VariationalRecurrentAutoencoder
             return_what = "mu" if isinstance(autoencoder, VariationalRecurrentAutoencoder) else None
-            dataset_encoded = encode_with_autoencoder(data=dataset, autoencoder=autoencoder, batch_size=256, return_what=return_what)
-            X_train = dataset_encoded.iloc[train_idx] if hasattr(dataset_encoded, 'iloc') else dataset_encoded[train_idx]
-            X_test = dataset_encoded.iloc[test_idx] if hasattr(dataset_encoded, 'iloc') else dataset_encoded[test_idx]
+            X_train = encode_with_autoencoder(data=X_train, autoencoder=autoencoder, batch_size=256, return_what=return_what)
+            X_test = encode_with_autoencoder(data=X_test, autoencoder=autoencoder, batch_size=256, return_what=return_what)
         else:
             X_train = X_train 
             X_test = X_test
@@ -603,4 +642,3 @@ class ExperimentRunner:
         return best_per_detector[['detector', metric, 'model_params'] + 
                                   [col for col in self.results.columns if col not in ['detector', metric, 'model_params']]]
     
-
