@@ -101,13 +101,16 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
         
         # Предполагаем, что есть метод from_pretrained
         # autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
-        try:
-            autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
-        except Exception as e:
-            logger.info(f"  ⚠ Не удалось загрузить как RecurrentAutoencoder: {e}")
-            logger.info(f"  Пробуем загрузить как VariationalRecurrentAutoencoder...")
+        if 'AutoencoderKL' in config.get('detectors', {}):
             autoencoder = VariationalRecurrentAutoencoder.from_pretrained(model_path)
+        else:
+            try:
+                autoencoder = RecurrentAutoencoder.from_pretrained(model_path)
+            except Exception as e:
+                logger.info(f"Loading as VariationalRecurrentAutoencoder after RAE failure: {e}")
+                autoencoder = VariationalRecurrentAutoencoder.from_pretrained(model_path)
         autoencoder.eval()
+        autoencoder._experiment_model_path = str(model_path)
         logger.info(f"Loaded autoencoder from {model_path}")
     for handler in logger.handlers:
         handler.flush()
@@ -120,7 +123,6 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
             logger=logger,
             **kwargs
         )
-    summary["window"] = config.get("window", 1)
     # Запуск эксперимента
     try:
         summary, pivot = run_with_logging(
@@ -147,6 +149,7 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
         
         # Сохранение summary
         if summary is not None:
+            summary["window"] = config['data']['window']
             summary.to_csv(results_dir / "summary.csv", index=False)
             pivot.to_csv(results_dir / "pivot_table.csv")
         
@@ -236,6 +239,7 @@ def run_experiments_by_anomaly(
     # timestamp = "-"
     all_best_models = []
     all_best_per_detector = []
+    all_result_tables = []
     
     for i in anomaly_numbers:
         logger.info(f"\n{'='*50}")
@@ -291,6 +295,30 @@ def run_experiments_by_anomaly(
             scale_after_split=scale_after_split,
             train_normal_only=train_normal_only,
         )
+        # Keep every detector/configuration, not only the winner on test.
+        scalar_results = results.drop(
+            columns=['test_scores', 'test_target', 'test_indices',
+                     'test_simulation_ids', 'survival_km'], errors='ignore'
+        ).copy()
+        scalar_results['anomaly_number'] = i
+        scalar_results['model_path'] = (
+            getattr(autoencoder, '_experiment_model_path', None)
+            if autoencoder is not None else None
+        )
+        all_result_tables.append(scalar_results)
+        scalar_results.to_csv(Path(results_path) / f"experiments_results_{i}.csv", index=False)
+        for result_index, row in results.iterrows():
+            score_data = {'scores': np.asarray(row['test_scores']),
+                          'target': np.asarray(row['test_target'])}
+            for key in ('test_indices', 'test_simulation_ids'):
+                value = row.get(key)
+                if isinstance(value, np.ndarray):
+                    score_data[key] = value
+            safe_name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in str(row['detector']))
+            np.savez_compressed(
+                Path(results_path) / f"scores_ANOM{i}_{result_index}_{safe_name}.npz",
+                **score_data,
+            )
         if hasattr(runner, 'scaler'):
             scaler_path = Path(results_path) / f"scaler_ANOM{i}.joblib"
             joblib.dump(runner.scaler, scaler_path)
@@ -305,7 +333,7 @@ def run_experiments_by_anomaly(
         best_pr['best_by_metric'] = 'pr_auc'
         all_best_models.append(best_pr)
         scores_filename = f"{results_path}/scores_ANOM{i}.npy"
-        np.save(scores_filename, np.stack([best_pr["test_scores"], best_pr["test_target"]]))
+        np.save(scores_filename, np.stack([best_pr.iloc[0]["test_scores"], best_pr.iloc[0]["test_target"]]))
         logger.info(f"Скоры и метки для test сохранены в {scores_filename}")
         
         best_roc = runner.get_best_models('roc_auc', top_k=1)
@@ -341,6 +369,10 @@ def run_experiments_by_anomaly(
         for handler in logger.handlers:
             handler.flush()
     
+    if all_result_tables:
+        pd.concat(all_result_tables, ignore_index=True).to_csv(
+            Path(results_path) / "all_results_summary.csv", index=False
+        )
     if all_best_models and all_best_per_detector:
         summary_df = pd.concat(all_best_models, ignore_index=True)
         numeric_cols = summary_df.select_dtypes(include=['number', 'bool', 'int64', 'float64', 'string']).columns.tolist()

@@ -183,6 +183,21 @@ class VariationalRecurrentAutoencoder(nn.Module):
         reconstructed = self.decode(z, x.size(1))
         return reconstructed, z, mu, log_var
 
+    def anomaly_scores(self, x: torch.Tensor):
+        """Raw per-window reconstruction MSE and KL(q(z|x) || N(0,I)).
+
+        Call in eval mode: reconstruction uses z=mu. No training free_bits,
+        beta, batch reduction or score clipping is applied.
+        """
+        if self.training:
+            raise RuntimeError("Call model.eval() before anomaly_scores")
+        reconstructed, _, mu, log_var = self(x)
+        reconstruction = (reconstructed - x).square().mean(
+            dim=tuple(range(1, x.ndim))
+        )
+        kl = 0.5 * (mu.square() + log_var.exp() - 1.0 - log_var).sum(dim=-1)
+        return {"reconstruction": reconstruction, "kl": kl}
+
     @classmethod
     def from_pretrained(cls, model_path: str, config_path: Optional[str] = None):
         if config_path is None:

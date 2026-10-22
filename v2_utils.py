@@ -15,6 +15,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from sklearn.model_selection import train_test_split, GroupShuffleSplit
 from torch.utils.data import DataLoader, TensorDataset
+from predictive_tcn import PredictiveTCNDetector
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -419,6 +420,36 @@ class AutoencoderReconstructionDetector(BaseAnomalyDetector):
             'type': 'autoencoder_reconstruction'
         }
 
+def compute_vae_scores(autoencoder, X, batch_size=256):
+    """Compute both scores together on the same windows, preserving model state."""
+    from vae import VariationalRecurrentAutoencoder
+    if not isinstance(autoencoder, VariationalRecurrentAutoencoder):
+        raise TypeError("AutoencoderKL requires VariationalRecurrentAutoencoder")
+    if batch_size < 1 or len(X) == 0:
+        raise ValueError("Expected positive batch_size and nonempty windows")
+    if hasattr(X, 'values'):
+        X = X.values
+    if X.ndim != 3:
+        raise ValueError("VAE scores require raw windows shaped (N,T,F)")
+    device = next(autoencoder.parameters()).device
+    was_training = autoencoder.training
+    batches = {'reconstruction': [], 'kl': []}
+    autoencoder.eval()
+    try:
+        with torch.no_grad():
+            for start in range(0, len(X), batch_size):
+                batch = torch.as_tensor(X[start:start + batch_size], dtype=torch.float32, device=device)
+                for name, values in autoencoder.anomaly_scores(batch).items():
+                    batches[name].append(values.detach().cpu().numpy())
+    finally:
+        autoencoder.train(was_training)
+    scores = {name: np.concatenate(values) for name, values in batches.items()}
+    for values in scores.values():
+        if values.shape != (len(X),) or not np.isfinite(values).all():
+            raise ValueError("Expected one finite VAE score per window")
+    return scores
+
+
 class ExperimentRunner:    
     def __init__(self, data_generator, evaluator=AdvancedDetectionEvaluator):
         self.data_generator = data_generator
@@ -546,7 +577,46 @@ class ExperimentRunner:
 
         ##
 
-        if autoencoder is not None and 'AutoencoderReconstruction' in model_params_list:
+        paired_vae = 'AutoencoderKL' in model_params_list
+        if paired_vae:
+            if autoencoder is None:
+                raise ValueError("AutoencoderKL requires autoencoder.model_path")
+            # Paired mode has no score hyperparameter search: one checkpoint,
+            # one test split, one forward per batch, two raw ranking scores.
+            recon_params = model_params_list.get('AutoencoderReconstruction', [{'reduction': 'mean'}])
+            kl_params = model_params_list['AutoencoderKL']
+            if recon_params not in ([{}], [{'reduction': 'mean'}]) or kl_params != [{}]:
+                raise ValueError("Paired VAE expects AutoencoderReconstruction: [{reduction: mean}] and AutoencoderKL: [{}]")
+            y_binary = np.asarray(y_test)
+            if set(np.unique(y_binary)) != {0, 1}:
+                raise ValueError("VAE ranking comparison requires both classes in test")
+            paired_scores = compute_vae_scores(autoencoder, X_test)
+            for score_name, detector_name in (
+                ('reconstruction', 'AutoencoderReconstruction'),
+                ('kl', 'AutoencoderKL'),
+            ):
+                scores = paired_scores[score_name]
+                precision, recall, _ = precision_recall_curve(y_binary, scores)
+                all_results.append({
+                    'detector': detector_name + '_' + autoencoder.get_name(),
+                    'score_type': score_name,
+                    'score_mode': 'raw_ranking_only',
+                    'pr_auc': auc(recall, precision),
+                    'roc_auc': roc_auc_score(y_binary, scores),
+                    'test_scores': scores,
+                    'test_target': y_binary.copy(),
+                    'test_indices': np.asarray(test_idx).copy(),
+                    'test_simulation_ids': np.asarray(sim_ids_test).astype(str),
+                    'n_test': len(y_binary),
+                    'test_prevalence': float(y_binary.mean()),
+                    'window': window,
+                    'size': len(dataset),
+                    'anomaly_ratio': np.mean(target),
+                    'model_params': {},
+                    'survival_km': None,
+                })
+
+        if not paired_vae and autoencoder is not None and 'AutoencoderReconstruction' in model_params_list:
             # Берем сырые данные (не кодированные)
             X_train_raw = X_train.copy()
             X_test_raw = X_test.copy()
@@ -580,8 +650,32 @@ class ExperimentRunner:
                 }
                 all_results.append(result)
 
+        for params in model_params_list.get('PredictiveTCN', []):
+            tcn_detector = PredictiveTCNDetector(**params)
+            tcn_detector.fit(X_train)
+            scores = tcn_detector.predict_scores(X_test)
+
+            evaluator = self.evaluator()
+            metrics = evaluator.calculate_metrics(
+                scores,
+                y_test,
+                optimal_thr=tcn_detector.threshold,
+                simulation_ids=sim_ids_test,
+            )
+            all_results.append({
+                'detector': 'PredictiveTCN',
+                **metrics,
+                **params,
+                'test_scores': np.asarray(scores),
+                'test_target': np.asarray(y_test),
+                'freq': '3min',
+                'size': len(dataset),
+                'anomaly_ratio': np.mean(target),
+                'model_params': params,
+            })
+
         # остальные детекторы с кодированием
-        if autoencoder is not None:
+        if autoencoder is not None and any(name in model_params_list for name in self.detectors):
             from autoencoders import encode_with_autoencoder
             from vae import VariationalRecurrentAutoencoder
             return_what = "mu" if isinstance(autoencoder, VariationalRecurrentAutoencoder) else None
