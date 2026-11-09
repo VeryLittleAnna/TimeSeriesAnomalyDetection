@@ -25,7 +25,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.svm import OneClassSVM
 from autoencoders import RecurrentAutoencoder
 from vae import VariationalRecurrentAutoencoder
-from loaders import Petrobras3WDataLoader, TiNADataLoader
+from loaders import Petrobras3WDataLoader, TiNADataLoader, TEP_baseline
 
 
 
@@ -162,6 +162,17 @@ def run_single_experiment(config_path: str, save_plots: bool = True):
 def build_data_loader(data_config: Dict[str, Any], anomaly_number):
     """Create a loader without changing the model/evaluator API."""
     dataset_type = data_config.get('dataset_type', 'tep').lower()
+
+    if dataset_type == 'tep_baseline':
+        if not data_config.get('scale_after_split', False):
+            raise ValueError('tep_baseline requires scale_after_split: true')
+        return TEP_baseline(
+            data_config['data_dir'], anomaly_number,
+            run_start=data_config.get('run_start', 1),
+            run_stop=data_config.get('run_stop', 500),
+            stride=data_config.get('stride', 1),
+            extract_stats=data_config.get('extract_stats', False),
+        )
 
     if dataset_type == 'tep':
         data_dir_template = data_config['data_dir_template']

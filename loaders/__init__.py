@@ -11,3 +11,5 @@ __all__ = [
     "TiNADataLoader",
     "standardize_train_test",
 ]
+
+from .tep_baseline import TEP_baseline

@@ -1,0 +1,29 @@
+# Copy detector/AE settings from your active experiment config.
+experiment:
+  name: tep_rieth_33_all_runs
+mode: retrain
+data:
+  dataset_type: tep_baseline
+  # Server data path.
+  data_dir: /home/grinenko/anna/TimeSeriesAnomalyDetection/data/tep_rieth_33
+  run_start: 1
+  run_stop: 500
+  window: 1
+  stride: 1
+  extract_stats: false
+  train_size: 0.7
+  split_strategy: group_random
+  random_state: 42
+  scale_after_split: true
+  train_normal_only: false  # Existing runner default; not a claim of Ou equivalence.
+anomaly_numbers: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+autoencoder:
+  model_path: null
+detectors:
+  IsolationForest:
+    - n_estimators: 100
+      random_state: 42
+output:
+  results_path: /home/grinenko/anna/TimeSeriesAnomalyDetection/results/tep_rieth_33
+  save_scores: true
+  save_plots: true
